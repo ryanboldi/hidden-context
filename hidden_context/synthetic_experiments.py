@@ -12,6 +12,9 @@ from matplotlib.gridspec import GridSpec
 from torch import nn, optim
 from torch.optim.lr_scheduler import ExponentialLR
 
+#stuff for b-rex
+from .bayesian_rex import compute_l2, calc_linearized_pairwise_ranking_loss, mcmc_map_search
+from .lexicase_rex import calc_lexicase_scores, lexicase_search
 
 class BaseRewardModel(nn.Module):
     network: Callable[[torch.Tensor], torch.Tensor]
@@ -28,21 +31,24 @@ class BaseRewardModel(nn.Module):
         super().__init__()
 
         layers: List[nn.Module] = []
-        for layer_index in range(num_layers):
+        for layer_index in range(num_layers - 1):
             if layer_index == 0:
                 layers.append(nn.Linear(state_dim, hidden_dim))
-            elif layer_index == num_layers - 1:
-                layers.append(nn.Linear(hidden_dim, output_dim))
             else:
                 layers.append(nn.Linear(hidden_dim, hidden_dim))
             if layer_index < num_layers - 1:
                 if use_batchnorm:
                     layers.append(nn.BatchNorm1d(hidden_dim))
                 layers.append(nn.ReLU())
+        
         self.network = nn.Sequential(*layers)
+        self.last_layer = nn.Linear(hidden_dim, output_dim) ##this is seperated for lexicase stuff
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
-        return self.network(state).squeeze(-1)
+        return self.last_layer(F.relu(self.network(state))).squeeze(-1)
+
+    def get_penultimate_layer(self, state: torch.Tensor) -> torch.Tensor:
+        return F.relu(self.network(state)).squeeze(-1)
 
     def preference_logp(
         self, state0: torch.Tensor, state1: torch.Tensor, preferences: torch.Tensor
@@ -59,6 +65,32 @@ class BaseRewardModel(nn.Module):
         reward_diff[preferences == 1] *= -1
         return -F.softplus(-reward_diff)
 
+
+# class BaseModelWithPenultimateLayer(BaseRewardModel):
+#     def __init__(self, *args, **kwargs):
+#         super().__init__(*args, **kwargs)
+
+#     def forward(self, state: torch.Tensor) -> torch.Tensor:
+#         return self.network(state)  
+    
+#     def get_penultimate_layer(self, state: torch.Tensor) -> torch.Tensor:
+#         return self.network(state).squeeze(-1)
+    
+#     def preference_logp(
+#         self, state0: torch.Tensor, state1: torch.Tensor, preferences: torch.Tensor
+#     ) -> torch.Tensor:
+#         """
+#         Return the log probability of the given preference comparisons according to the
+#         model. If preferences[i] == 0, then state0 is preferred to state1, and vice
+#         versa.
+#         """
+
+#         reward0 = self.forward(state0)
+#         reward1 = self.forward(state1)
+#         reward_diff = reward0 - reward1
+#         reward_diff[preferences == 1] *= -1
+#         return -F.softplus(-reward_diff)
+    
 
 class MeanAndVarianceRewardModel(BaseRewardModel):
     def __init__(self, *args, max_std=np.inf, **kwargs):
@@ -198,6 +230,169 @@ def train_rlhf(
 
     return reward_model
 
+def train_brex(
+    *,
+    reward_model: BaseRewardModel,
+    reward_fn: Callable[[torch.Tensor], torch.Tensor],
+    sample_state: Callable[[int], torch.Tensor],
+    batch_size: int,
+    lr: float,
+    num_iterations: int,
+    device: torch.device,
+) -> BaseRewardModel:
+    """Trains and returns a reward model using Bayesian Reward Extrapolation.
+    Args:
+        reward_fn: The ground truth reward/utility function, which can be randomized.
+        state_dim: The dimension of the state space.
+        sample_state: A function that samples states from the state space, i.e.
+            sample_state(n) returns n samples from the state space.
+        batch_size: The batch size for training the reward function.
+        num_iterations: The number of iterations to train the reward function.
+    """
+    #first, we will train a model with RLHF, and delete the last layer
+    reward_model = train_rlhf(reward_model=reward_model,
+                              reward_fn= reward_fn,
+                            sample_state = sample_state,
+                            batch_size = batch_size,
+                            lr = lr,
+                            num_iterations = int(num_iterations),
+                            device = device)
+    
+    #features
+    #features = reward_model.get_penultimate_layer(sample_state(batch_size).to(device))
+
+    #labels
+    labels = reward_fn(sample_state(batch_size).to(device))
+
+    state0 = sample_state(batch_size).to(device)
+    state1 = sample_state(batch_size).to(device)
+    features0 = reward_model.get_penultimate_layer(state0)
+    features1 = reward_model.get_penultimate_layer(state1)
+
+    rewards0 = reward_fn(state0)
+    rewards1 = reward_fn(state1)
+    preferences = (rewards1 > rewards0).long()
+
+    #print(f"labels: {labels}")
+    #print(f"labels shape: {labels.shape}")
+
+    best_reward_lastlayer, chain, logliks = mcmc_map_search(reward_model, preferences, features0, features1, num_iterations//10, 0.1, 1)
+
+    #interpolating the features to get variances
+    state_interpolated = torch.linspace(0, 1, 100).to(device)
+    features_interpolated = reward_model.get_penultimate_layer(state_interpolated[:, None])
+    chain = torch.from_numpy(chain).squeeze(1)
+    print(f"features interpolated shape: {features_interpolated.shape}")
+    print(f"chain shape: {chain.shape}")
+    returns = features_interpolated @ chain.T
+    mean_model = returns.mean(axis=1)
+    all_models = returns
+    print(f"returns shape: {returns.shape}")
+    variances = torch.var(returns, axis=1)
+
+    best_reward_model = reward_model
+    best_reward_lastlayer = best_reward_lastlayer.to(device)
+    best_reward_model.last_layer = best_reward_lastlayer
+    
+    print(f"best_reward_lastlayer: {[p for p in best_reward_lastlayer.parameters()]}")
+    print(f"best_reward_model: {[p for p in best_reward_model.last_layer.parameters()]}")
+
+    #evaluate the model
+    state0 = sample_state(batch_size).to(device)
+    state1 = sample_state(batch_size).to(device)
+    rewards0 = reward_fn(state0)
+    rewards1 = reward_fn(state1)
+    loss = -best_reward_model.preference_logp(state0, state1, (rewards1 > rewards0).long()).mean()
+    print(f"loss for B_REX MAP: {loss.item()}")
+
+    return best_reward_model, variances, mean_model, all_models
+
+def train_lex(
+    *,
+    reward_model: BaseRewardModel,
+    reward_fn: Callable[[torch.Tensor], torch.Tensor],
+    sample_state: Callable[[int], torch.Tensor],
+    batch_size: int,
+    lr: float,
+    num_iterations: int,
+    device: torch.device,
+) -> BaseRewardModel:
+    """Trains and returns a reward model using lexicase selection.
+    Args:
+        reward_fn: The ground truth reward/utility function, which can be randomized.
+        state_dim: The dimension of the state space.
+        sample_state: A function that samples states from the state space, i.e.
+            sample_state(n) returns n samples from the state space.
+        batch_size: The batch size for training the reward function.
+        num_iterations: The number of iterations to train the reward function.
+    """
+    #first, we will train a model with RLHF, and delete the last layer
+    reward_model = train_rlhf(reward_model=reward_model,
+                              reward_fn= reward_fn,
+                            sample_state = sample_state,
+                            batch_size = batch_size,
+                            lr = lr,
+                            num_iterations = int(num_iterations),
+                            device = device)
+
+    #labels
+    labels = reward_fn(sample_state(batch_size).to(device))
+
+    state0 = sample_state(batch_size).to(device)
+    state1 = sample_state(batch_size).to(device)
+    features0 = reward_model.get_penultimate_layer(state0)
+    features1 = reward_model.get_penultimate_layer(state1)
+
+    rewards0 = reward_fn(state0)
+    rewards1 = reward_fn(state1)
+    preferences = (rewards1 > rewards0).long()
+
+    #print(f"labels: {labels}")
+    #print(f"labels shape: {labels.shape}")
+
+    population, scores, best_scores = lexicase_search(preferences, features0, features1, num_iterations//10, num_iterations, 0.1, normalize=True, downsample_level=100)
+
+    sum_scores = np.sum(scores, axis=1)
+    best_reward_lastlayer = torch.from_numpy(population[np.argmax(sum_scores)])
+    print(f"best_reward_lastlayer shape: {best_reward_lastlayer.shape}")
+    print(f"best_reward_lastlayer: {best_reward_lastlayer}")
+    best_reward_lastlayer = best_reward_lastlayer.to(device)
+
+    #interpolating the features to get variances
+    state_interpolated = torch.linspace(0, 1, 100).to(device)
+    features_interpolated = reward_model.get_penultimate_layer(state_interpolated[:, None])
+    # chain = torch.from_numpy(chain).squeeze(1)
+    population = torch.from_numpy(population).to(device).squeeze(1).to(torch.float32)
+    print(f"features interpolated dtype: {features_interpolated.dtype}")
+    print(f"chain dtype: {population.dtype}")
+    returns = features_interpolated @ population.T
+
+    mean_model = returns.mean(axis=1)
+    all_models = returns
+    # print(f"returns shape: {returns.shape}")
+    variances = torch.var(returns, axis=1)
+
+    best_reward_model = reward_model
+    best_reward_model.last_layer = torch.nn.Linear(reward_model.last_layer.in_features, 1, bias=False).to(device)
+    
+    print(f"best_reward_lastlayer shape: {best_reward_lastlayer.shape}")
+    print(f"best_reward_lastlayer: {best_reward_lastlayer}")
+    for param in best_reward_model.last_layer.parameters():
+        print(f"param before: {param}")
+        #copy param from best_reward_lastlayer
+        param.data = best_reward_lastlayer
+        print(f"param after: {param}" )
+
+    #evaluate the model
+    state0 = sample_state(batch_size).to(device)
+    state1 = sample_state(batch_size).to(device)
+    rewards0 = reward_fn(state0)
+    rewards1 = reward_fn(state1)
+    loss = -best_reward_model.preference_logp(state0, state1, (rewards1 > rewards0).long()).mean()
+    print(f"loss for LEX BEST: {loss.item()}")
+
+    return best_reward_model, variances, mean_model, all_models
+
 
 def reward_fn_1d(state: torch.Tensor) -> torch.Tensor:
     state = state.squeeze(-1)
@@ -207,7 +402,6 @@ def reward_fn_1d(state: torch.Tensor) -> torch.Tensor:
     rewards[(state >= 0.8) & ~double_rewards] *= 0
     return rewards
 
-
 def reward_fn_2d(state: torch.Tensor) -> torch.Tensor:
     x, y = state[..., 0], state[..., 1]
     b = torch.rand(x.shape, device=x.device) < 1 - x * y
@@ -215,7 +409,6 @@ def reward_fn_2d(state: torch.Tensor) -> torch.Tensor:
     rewards[b] = (y / (1 - x * y))[b]
     rewards[~b] = 0
     return rewards
-
 
 def main(  # noqa: C901
     *,
@@ -243,9 +436,9 @@ def main(  # noqa: C901
     reward_model_class: Type[BaseRewardModel]
     for reward_model_class in [
         BaseRewardModel,
-        MeanAndVarianceRewardModel,
-        CategoricalRewardModel,
-        ClassifierRewardModel,
+        #MeanAndVarianceRewardModel,
+        #CategoricalRewardModel,
+        #ClassifierRewardModel,
     ]:
         print(f"Training {reward_model_class.__name__}...")
         kwargs = dict(reward_model_kwargs)
@@ -264,6 +457,46 @@ def main(  # noqa: C901
         reward_model.eval()
         reward_models[reward_model_class.__name__] = reward_model
 
+    #Bayesian REX
+    b_rex_model = MeanAndVarianceRewardModel(state_dim = state_dim, **(dict(reward_model_kwargs)))
+    b_rex_model, b_rex_variances, brex_mean, brex_all = train_brex(
+        reward_model=b_rex_model,
+        reward_fn=reward_fn,
+        sample_state=sample_state,
+        batch_size=batch_size,
+        lr=lr,
+        num_iterations=num_iterations,
+        device=device,
+    )
+    b_rex_model.eval()
+    reward_models["B_REX"] = b_rex_model
+
+    print(f"brex variances: {b_rex_variances}")
+    print(f"brex variances shape: {b_rex_variances.shape}")
+    print(f"brex mean: {brex_mean}")
+    print(f"brex mean shape: {brex_mean.shape}")
+
+    #Lexicase
+    lex_model = MeanAndVarianceRewardModel(state_dim = state_dim, **(dict(reward_model_kwargs)))
+    lex_model, lex_variances, lex_mean, lex_all = train_lex(
+        reward_model=lex_model,
+        reward_fn=reward_fn,
+        sample_state=sample_state,
+        batch_size=batch_size,
+        lr=lr,
+        num_iterations=num_iterations,
+        device=device,
+    )
+    lex_model.eval()
+    reward_models["Lexicase"] = lex_model
+
+    print(f"lex variances: {lex_variances}")
+    print(f"lex variances shape: {lex_variances.shape}")
+    print(f"lex mean: {lex_mean}")
+    print(f"lex mean shape: {lex_mean.shape}")
+
+    #-=============================
+    
     experiment_dir = os.path.join(
         out_dir,
         env_name,
@@ -306,14 +539,14 @@ def main(  # noqa: C901
     matplotlib.rc("text.latex", preamble=latex_preamble)
     matplotlib.rc("font", size=9)
     matplotlib.rc("pgf", rcfonts=False, texsystem="pdflatex", preamble=latex_preamble)
-    figure = plt.figure(figsize=(5.5, 1.2))
+    figure = plt.figure(figsize=(5.5, 4.2))
     cmap = "Greys"
     color = "k"
     title_kwargs = dict(fontsize=9)
 
     if env_name == "1d":
         x = torch.linspace(0, 1, 100, device=device)
-        num_rows = 1
+        num_rows = 3
         num_cols = 3
 
         # Combine first three subplots into one
@@ -393,43 +626,118 @@ def main(  # noqa: C901
         #     borderaxespad=0.1,
         # )
 
-        # Mean and Variance Subplot
-        mean_and_variance_ax = figure.add_subplot(num_rows, num_cols, 2)
-        mean_and_variance_ax.set_title("DPL (mean and variance)", **title_kwargs)
-        mean_and_variance_ax.set_xlabel(r"$\alta$")
-        mean_and_variance_ax.set_ylabel(r"$\hat{\mu}(\alta) \pm \hat{\sigma}(\alta)$")
-        mean_and_variance_ax.set_xlim(0, 1)
-        mean_and_log_std = (
-            reward_models["MeanAndVarianceRewardModel"](x[:, None]).detach().cpu()
-        )
-        mean = mean_and_log_std[:, 0]
-        std = torch.exp(mean_and_log_std[:, 1])
-        mean_and_variance_ax.plot(x.cpu(), mean, color=color)
-        ymin = mean.min() - 1
-        ymax = mean.max() + 1
-        mean_and_variance_ax.fill_between(
-            x.cpu(),
-            np.clip(mean - std, ymin, ymax),
-            np.clip(mean + std, ymin, ymax),
-            alpha=0.2,
-            color=color,
-        )
-        mean_and_variance_ax.set_ylim(mean.min() - 1, mean.max() + 1)
+        print(f"brex model: {b_rex_model(x[:, None]).detach().cpu().shape}")
 
-        # Categorical Subplot
-        categorical_ax = figure.add_subplot(num_rows, num_cols, 3)
-        categorical_ax.set_title("DPL (categorical)", **title_kwargs)
-        categorical_ax.set_xlabel(r"$\alta$")
-        categorical_ax.set_ylabel(r"$\hat{p}(\utility \mid \alta)$")
-        categorical_ax.set_xlim(0, 1)
-        dist = reward_models["CategoricalRewardModel"](x[:, None]).detach().cpu()
-        categorical_ax.imshow(
-            dist.transpose(0, 1),
-            origin="lower",
-            extent=(0, 1, 0, 1),
-            aspect="auto",
-            cmap=cmap,
-        )
+        #BREX Subplot
+        brex_ax = figure.add_subplot(num_rows, num_cols, 2)
+        brex_ax.set_title("B-REX MAP", **title_kwargs)
+        brex_ax.set_xlabel(r"$\alta$")
+        brex_ax.set_ylabel(r"$\hat{\mu}(\alta)$")
+        brex_ax.set_xlim(0, 1)
+        brex_ax.plot(x.cpu(), b_rex_model(x[:, None]).detach().cpu()[:, 0], color=color)
+        b_rex_std = torch.sqrt(b_rex_variances).detach().cpu()
+        #plot std from 0
+        #brex_ax.fill_between(x.cpu(), 0, b_rex_std, alpha=0.2, color=color)
+
+        brex_ax = figure.add_subplot(num_rows, num_cols, 5)
+        brex_ax.set_title("B-REX All", **title_kwargs)
+        brex_ax.set_xlabel(r"$\alta$")
+        brex_ax.set_ylabel(r"$\hat{\mu}(\alta)$")
+        brex_ax.set_xlim(0, 1)
+        brex_ax.plot(x.cpu(), brex_all.detach().cpu(), color=color, alpha=0.1)
+
+        brex_ax = figure.add_subplot(num_rows, num_cols, 8)
+        brex_ax.set_title("B-REX Samples", **title_kwargs)
+        brex_ax.set_xlabel(r"$\alta$")
+        brex_ax.set_ylabel(r"$\hat{\mu}(\alta)$")
+        brex_ax.set_xlim(0, 1)
+        print(f"brex all shape: {brex_all.shape}")
+        #randomly sample 10 models
+        brex_samples = brex_all[:,np.random.choice(brex_all.shape[1], 10, replace=False)]
+        brex_ax.plot(x.cpu(), brex_samples.detach().cpu(), color=color, alpha=0.5)
+
+
+        #plot std
+        #brex_ax.fill_between(x.cpu(), b_rex_model(x[:, None]).detach().cpu() - b_rex_std, b_rex_model(x[:, None]).detach().cpu() + b_rex_std, alpha=0.2, color=color)
+        #brex mean
+        #brex_ax.plot(x.cpu(), brex_mean.detach().cpu(), color="tab:red", label=r"$\exutility(\alta)$")
+        #brex_ax.fill_between(x.cpu(), brex_mean.detach().cpu() - b_rex_std, brex_mean.detach().cpu() + b_rex_std, alpha=0.2, color="tab:red")
+        #plot all brex_models
+        
+
+        #lexicase Subplot
+        lex_ax = figure.add_subplot(num_rows, num_cols, 3)
+        lex_ax.set_title("Lexicase Best", **title_kwargs)
+        lex_ax.set_xlabel(r"$\alta$")
+        lex_ax.set_ylabel(r"$\hat{\mu}(\alta)$")
+        lex_ax.set_xlim(0, 1)
+        lex_ax.plot(x.cpu(), lex_model(x[:, None]).detach().cpu()[:, 0], color=color)
+        #lex_std = torch.sqrt(lex_variances).detach().cpu()
+        #plot std from 0    
+
+       # lex_ax.fill_between(x.cpu(), 0, lex_std, alpha=0.2, color=color)
+        
+        #std
+        #lex_ax.fill_between(x.cpu(), lex_model(x[:, None]).detach().cpu() - lex_std, lex_model(x[:, None]).detach().cpu() + lex_std, alpha=0.2, color=color)
+
+        #lex all
+        lex_ax = figure.add_subplot(num_rows, num_cols, 6)
+        lex_ax.set_title("Lexicase All", **title_kwargs)
+        lex_ax.set_xlabel(r"$\alta$")
+        lex_ax.set_ylabel(r"$\hat{\mu}(\alta)$")
+        lex_ax.set_xlim(0, 1)
+        lex_ax.plot(x.cpu(), lex_all.detach().cpu(), color=color, alpha=0.1)
+
+        lex_ax = figure.add_subplot(num_rows, num_cols, 9)
+        lex_ax.set_title("Lexicase Samples", **title_kwargs)
+        lex_ax.set_xlabel(r"$\alta$")
+        lex_ax.set_ylabel(r"$\hat{\mu}(\alta)$")
+        lex_ax.set_xlim(0, 1)
+        #randomly sample 10 models
+        lex_samples = lex_all[:,np.random.choice(lex_all.shape[1], 10, replace=False)]
+        lex_ax.plot(x.cpu(), lex_samples.detach().cpu(), color=color, alpha=0.5)
+
+        #mean
+        #lex_ax.plot(x.cpu(), lex_mean.detach().cpu(), color="tab:red", label=r"$\exutility(\alta)$")
+        #lex_ax.fill_between(x.cpu(), lex_mean.detach().cpu() - lex_std, lex_mean.detach().cpu() + lex_std, alpha=0.2, color="tab:red")
+        
+        # Mean and Variance Subplot
+        # mean_and_variance_ax = figure.add_subplot(num_rows, num_cols, 2)
+        # mean_and_variance_ax.set_title("DPL (mean and variance)", **title_kwargs)
+        # mean_and_variance_ax.set_xlabel(r"$\alta$")
+        # mean_and_variance_ax.set_ylabel(r"$\hat{\mu}(\alta) \pm \hat{\sigma}(\alta)$")
+        # mean_and_variance_ax.set_xlim(0, 1)
+        # mean_and_log_std = (
+        #     reward_models["MeanAndVarianceRewardModel"](x[:, None]).detach().cpu()
+        # )
+        # mean = mean_and_log_std[:, 0]
+        # std = torch.exp(mean_and_log_std[:, 1])
+        # mean_and_variance_ax.plot(x.cpu(), mean, color=color)
+        # ymin = mean.min() - 1
+        # ymax = mean.max() + 1
+        # mean_and_variance_ax.fill_between(
+        #     x.cpu(),
+        #     np.clip(mean - std, ymin, ymax),
+        #     np.clip(mean + std, ymin, ymax),
+        #     alpha=0.2,
+        #     color=color,
+        # )
+        # mean_and_variance_ax.set_ylim(mean.min() - 1, mean.max() + 1)
+
+        # # Categorical Subplot
+        # categorical_ax = figure.add_subplot(num_rows, num_cols, 3)
+        # categorical_ax.set_title("DPL (categorical)", **title_kwargs)
+        # categorical_ax.set_xlabel(r"$\alta$")
+        # categorical_ax.set_ylabel(r"$\hat{p}(\utility \mid \alta)$")
+        # categorical_ax.set_xlim(0, 1)
+        # dist = reward_models["CategoricalRewardModel"](x[:, None]).detach().cpu()
+        # categorical_ax.imshow(
+        #     dist.transpose(0, 1),
+        #     origin="lower",
+        #     extent=(0, 1, 0, 1),
+        #     aspect="auto",
+        #     cmap=cmap,
+        # )
 
         figure.tight_layout(pad=0.1)
         figure.subplots_adjust(wspace=0.7, left=0.05, right=0.95)
