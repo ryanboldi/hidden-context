@@ -79,8 +79,6 @@ def lexicase_search(pairwise_prefs, features0, features1, popsize, num_steps, st
     
     scores = calc_lexicase_scores(population, features0[ds_indices], features1[ds_indices], pairwise_prefs[ds_indices])
 
-    print(f"scores shape {scores.shape}")
-
     #sum_scores = np.sum(scores, axis=1)
 
     #print(f"score of perfect individual: {sum_scores[0]}")
@@ -137,11 +135,16 @@ def lexicase_search(pairwise_prefs, features0, features1, popsize, num_steps, st
             population = population / np.linalg.norm(population, axis=1)[:, None]
 
     #one more selection
-    #scores = calc_lexicase_scores(population, features0, features1, pairwise_prefs)
-    #selected = select_from_scores(scores, selection=selection, elitism=elitism, epsilon=False)
-    #population = population[selected[int(elitism):]]
+    scores = calc_lexicase_scores(population, features0, features1, pairwise_prefs)
+    selected = select_from_scores(scores, selection=selection, elitism=elitism, epsilon=False)
+    population = population[selected[int(elitism):]]
 
     return population, scores, None #, best_scores
+
+def select_one(population, features0, features1, pairwise_prefs):
+    scores = calc_lexicase_scores(population, features0, features1, pairwise_prefs)
+    selected = select_from_scores(scores, selection="lex", elitism=False, epsilon=False)
+    return population[selected[0]], scores[selected[0]]
 
 def generate_feature_counts_from_model(demos, reward_net, n, device):
     feature_cnts = torch.zeros(len(demos), n) #no bias

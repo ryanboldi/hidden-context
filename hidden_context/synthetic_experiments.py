@@ -14,7 +14,9 @@ from torch.optim.lr_scheduler import ExponentialLR
 
 #stuff for b-rex
 from .bayesian_rex import compute_l2, calc_linearized_pairwise_ranking_loss, mcmc_map_search
-from .lexicase_rex import calc_lexicase_scores, lexicase_search
+from .lexicase_rex import calc_lexicase_scores, lexicase_search, select_one
+
+import inspect
 
 class BaseRewardModel(nn.Module):
     network: Callable[[torch.Tensor], torch.Tensor]
@@ -41,8 +43,13 @@ class BaseRewardModel(nn.Module):
                     layers.append(nn.BatchNorm1d(hidden_dim))
                 layers.append(nn.ReLU())
         
-        self.network = nn.Sequential(*layers)
-        self.last_layer = nn.Linear(hidden_dim, output_dim) ##this is seperated for lexicase stuff
+        if (num_layers > 1):
+            self.network = nn.Sequential(*layers)
+            self.last_layer = nn.Linear(hidden_dim, output_dim) ##this is seperated for lexicase stuff
+        else:
+            #identity
+            self.network = nn.Identity()
+            self.last_layer = nn.Linear(state_dim, output_dim) ##this is seperated for lexicase stuff
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
         return self.last_layer(F.relu(self.network(state))).squeeze(-1)
@@ -195,6 +202,7 @@ def train_rlhf(
     lr: float,
     num_iterations: int,
     device: torch.device,
+    flip_percentage: float = 0,
 ) -> BaseRewardModel:
     """
     Trains and returns a reward function using RLHF.
@@ -217,9 +225,20 @@ def train_rlhf(
         optimizer.zero_grad()
         state0 = sample_state(batch_size).to(device)
         state1 = sample_state(batch_size).to(device)
-        rewards0 = reward_fn(state0)
-        rewards1 = reward_fn(state1)
+        if (len(inspect.signature(reward_fn).parameters.keys()) == 2):
+            identity = torch.randint(0, 2, state0.shape, device=state0.device)
+            rewards0 = reward_fn(state0, identity)
+            rewards1 = reward_fn(state1, identity)
+        else:
+            rewards0 = reward_fn(state0)
+            rewards1 = reward_fn(state1)
         preferences = (rewards1 > rewards0).long()
+
+        #randomly flip
+        flip = torch.rand(preferences.squeeze(-1).shape, device=preferences.device) < flip_percentage
+        # if 0 -> 1, if 1 -> 0
+        preferences[flip] = 1 - preferences[flip]
+
         loss = -reward_model.preference_logp(state0, state1, preferences).mean()
         loss.backward()
         optimizer.step()
@@ -239,6 +258,8 @@ def train_brex(
     lr: float,
     num_iterations: int,
     device: torch.device,
+    likelihood: str = "bradley-terry",
+    flip_percentage: float = 0,
 ) -> BaseRewardModel:
     """Trains and returns a reward model using Bayesian Reward Extrapolation.
     Args:
@@ -250,33 +271,40 @@ def train_brex(
         num_iterations: The number of iterations to train the reward function.
     """
     #first, we will train a model with RLHF, and delete the last layer
-    reward_model = train_rlhf(reward_model=reward_model,
-                              reward_fn= reward_fn,
-                            sample_state = sample_state,
-                            batch_size = batch_size,
-                            lr = lr,
-                            num_iterations = int(num_iterations),
-                            device = device)
-    
-    #features
-    #features = reward_model.get_penultimate_layer(sample_state(batch_size).to(device))
-
-    #labels
-    labels = reward_fn(sample_state(batch_size).to(device))
+    #reward_model = train_rlhf(reward_model=reward_model,
+    #                          reward_fn= reward_fn,
+    #                        sample_state = sample_state,
+    #                        batch_size = batch_size,
+    #                        lr = lr,
+    #                        num_iterations = int(num_iterations),
+    #                        device = device)
 
     state0 = sample_state(batch_size).to(device)
     state1 = sample_state(batch_size).to(device)
     features0 = reward_model.get_penultimate_layer(state0)
     features1 = reward_model.get_penultimate_layer(state1)
 
-    rewards0 = reward_fn(state0)
-    rewards1 = reward_fn(state1)
+
+    if (len(inspect.signature(reward_fn).parameters.keys()) == 2):
+        identity = torch.randint(0, 2, state0.shape, device=state0.device)
+        #identity = torch.rand(state0.shape, device=state0.device) < 0.5
+        rewards0 = reward_fn(state0, identity)
+        rewards1 = reward_fn(state1, identity)
+    else:
+        rewards0 = reward_fn(state0)
+        rewards1 = reward_fn(state1)
+    
     preferences = (rewards1 > rewards0).long()
+
+    #randomly flip
+    flip = torch.rand(preferences.shape, device=preferences.device) < flip_percentage
+    # if 0 -> 1, if 1 -> 0
+    preferences[flip] = 1 - preferences[flip]
 
     #print(f"labels: {labels}")
     #print(f"labels shape: {labels.shape}")
 
-    best_reward_lastlayer, chain, logliks = mcmc_map_search(reward_model, preferences, features0, features1, num_iterations//10, 0.1, 1)
+    best_reward_lastlayer, chain, logliks = mcmc_map_search(reward_model, preferences, features0, features1, num_iterations*10, 0.01, 1, likelihood)
 
     #interpolating the features to get variances
     state_interpolated = torch.linspace(0, 1, 100).to(device)
@@ -286,22 +314,143 @@ def train_brex(
     print(f"chain shape: {chain.shape}")
     returns = features_interpolated @ chain.T
     mean_model = returns.mean(axis=1)
-    all_models = returns
-    print(f"returns shape: {returns.shape}")
     variances = torch.var(returns, axis=1)
+
+
+    if (len(inspect.signature(reward_fn).parameters.keys()) == 2):
+        true_rewards_1 = reward_fn(state_interpolated, torch.tensor(0))
+        true_rewards_2 = reward_fn(state_interpolated, torch.tensor(1))
+
+        preference_matrix_1 = torch.zeros((100, 100), dtype=torch.long)
+        preference_matrix_2 = torch.zeros((100, 100), dtype=torch.long)
+
+        for i in range(100):
+            for j in range(100):
+                if (true_rewards_1[i] >= true_rewards_1[j]):
+                    preference_matrix_1[i, j] = 1
+
+                if (true_rewards_2[i] >= true_rewards_2[j]):
+                    preference_matrix_2[i, j] = 1
+            
+        
+        #get preference passes
+        passes_1 = preference_pass_matrix(returns, preference_matrix_1)
+        passes_2 = preference_pass_matrix(returns, preference_matrix_2)
+
+        #sum of passes, save to text file
+        sum_passes_1 = torch.sum(passes_1)
+        sum_passes_2 = torch.sum(passes_2)
+
+        s0 = sample_state(40).to(device)
+        s1 = sample_state(40).to(device)
+        f0 = reward_model.get_penultimate_layer(s0)
+        f1 = reward_model.get_penultimate_layer(s1)
+        r0_z1 = reward_fn(s0, torch.tensor(1))
+        r1_z1 = reward_fn(s1, torch.tensor(1))
+        r0_z0 = reward_fn(s0, torch.tensor(0))
+        r1_z0 = reward_fn(s1, torch.tensor(0))
+        pp0 = (r1_z0 > r0_z0).long()
+        pp1 = (r1_z1 > r0_z1).long()
+
+        ind0, score0 = select_one(chain, f0, f1, pp0) 
+        
+        ret0 = features_interpolated @ ind0.T
+        ind1, score1 = select_one(chain, f0, f1, pp1)
+        ret1 = features_interpolated @ ind1.T
+
+        print(f"ind0: {ind0}")
+        print(f"scores0: {score0}")
+        print(f"ind1: {ind1}")
+        print(f"scores1: {score1}")
+
+        #normalize ret0 and ret1
+        ret0 = ret0 / torch.norm(ret0)
+        ret1 = ret1 / torch.norm(ret1)
+
+        #graph these individuals
+        #make it pretty
+        #plt.plot(state_interpolated.detach().numpy(), ret0.detach().numpy(), label="0")
+        #plt.plot(state_interpolated.detach().numpy(), ret1.detach().numpy(), label="1")
+        #scale each line by its own min and max
+        fig, ax1 = plt.subplots(figsize=(5, 5))
+        ax2 = ax1.twinx()
+        ax1.plot(state_interpolated.detach().numpy(), ret0.detach().numpy(), label="0", color='blue')
+        ax2.plot(state_interpolated.detach().numpy(), ret1.detach().numpy(), label="1", color='red')
+        lines, labels = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax2.legend(lines + lines2, labels + labels2, loc=0)
+
+        plt.savefig(f'./results/1d_identity/{batch_size}_{lr}_{num_iterations}/b_rex_individuals_{likelihood}_{num_iterations}_{flip_percentage}.png')
+        plt.close()
+
+        with open(f'./results/1d_identity/{batch_size}_{lr}_{num_iterations}/b_rex_num_passes_{likelihood}_{num_iterations}_{flip_percentage}.txt', 'w') as f:
+            f.write(f"sum_passes_1: {sum_passes_1}\n")
+            f.write(f"sum_passes_2: {sum_passes_2}\n")
+
+        #save heatmap
+        #plt.imshow(passes_1, cmap='hot', interpolation='nearest', aspect='auto')
+        #colorbar should go between 0 and 10,000
+        plt.pcolor(passes_1, cmap='hot', vmin=0, vmax=10000)
+        plt.colorbar()
+        plt.savefig(f'./results/1d_identity/{batch_size}_{lr}_{num_iterations}/b_rex_passes_1_{likelihood}_{num_iterations}_{flip_percentage}.png')
+        plt.close()
+        
+        plt.pcolor(passes_2, cmap='hot', vmin=0, vmax=10000)
+        plt.colorbar()
+        plt.savefig(f'./results/1d_identity/{batch_size}_{lr}_{num_iterations}/b_rex_passes_2_{likelihood}_{num_iterations}_{flip_percentage}.png')
+        plt.close()
+
+    else:
+        true_rewards = reward_fn(state_interpolated)
+
+        #get the ground truth preference matrix for all states
+        preference_matrix  = torch.zeros((100, 100), dtype=torch.long)
+        for i in range(100):
+            for j in range(100):
+                if (true_rewards[i] >= true_rewards[j]):
+                    preference_matrix[i, j] = 1
+
+        #get preference passes
+        passes = preference_pass_matrix(returns, preference_matrix)
+
+        #sum of passes, save to text file
+        sum_passes = torch.sum(passes)
+        with open(f'./results/1d_identity/{batch_size}_{lr}_{num_iterations}/b_rex_num_passes_{likelihood}_{num_iterations}_{flip_percentage}.txt', 'w') as f:
+            f.write(f"sum_passes: {sum_passes}\n")
+
+        #save heatmap
+        plt.pcolor(passes, cmap='hot', vmin=0, vmax=10000)
+        plt.colorbar()
+
+        plt.savefig(f'./results/1d_identity/{batch_size}_{lr}_{num_iterations}/b_rex_passes_{likelihood}_{num_iterations}_{flip_percentage}.png')
+        plt.close()
+
 
     best_reward_model = reward_model
     best_reward_lastlayer = best_reward_lastlayer.to(device)
     best_reward_model.last_layer = best_reward_lastlayer
+
     
-    print(f"best_reward_lastlayer: {[p for p in best_reward_lastlayer.parameters()]}")
-    print(f"best_reward_model: {[p for p in best_reward_model.last_layer.parameters()]}")
+
+    
+    #unique_indicies = remove_same_rankings(returns)
+
+    #all_models = returns[:, unique_indicies]
+    all_models = returns
+    
+    #print(f"best_reward_lastlayer: {[p for p in best_reward_lastlayer.parameters()]}")
+    #print(f"best_reward_model: {[p for p in best_reward_model.last_layer.parameters()]}")
 
     #evaluate the model
     state0 = sample_state(batch_size).to(device)
     state1 = sample_state(batch_size).to(device)
-    rewards0 = reward_fn(state0)
-    rewards1 = reward_fn(state1)
+    if (len(inspect.signature(reward_fn).parameters.keys()) == 2):
+        identity = torch.randint(0, 2, state0.shape, device=state0.device)
+        rewards0 = reward_fn(state0, identity)
+        rewards1 = reward_fn(state1, identity)
+    else:
+        rewards0 = reward_fn(state0)
+        rewards1 = reward_fn(state1)
     loss = -best_reward_model.preference_logp(state0, state1, (rewards1 > rewards0).long()).mean()
     print(f"loss for B_REX MAP: {loss.item()}")
 
@@ -316,6 +465,7 @@ def train_lex(
     lr: float,
     num_iterations: int,
     device: torch.device,
+    flip_percentage: float = 0,
 ) -> BaseRewardModel:
     """Trains and returns a reward model using lexicase selection.
     Args:
@@ -327,30 +477,37 @@ def train_lex(
         num_iterations: The number of iterations to train the reward function.
     """
     #first, we will train a model with RLHF, and delete the last layer
-    reward_model = train_rlhf(reward_model=reward_model,
-                              reward_fn= reward_fn,
-                            sample_state = sample_state,
-                            batch_size = batch_size,
-                            lr = lr,
-                            num_iterations = int(num_iterations),
-                            device = device)
-
-    #labels
-    labels = reward_fn(sample_state(batch_size).to(device))
+    #reward_model = train_rlhf(reward_model=reward_model,
+    #                          reward_fn= reward_fn,
+    #                        sample_state = sample_state,
+    #                        batch_size = batch_size,
+    #                        lr = lr,
+    #                        num_iterations = int(num_iterations),
+    #                        device = device)
 
     state0 = sample_state(batch_size).to(device)
     state1 = sample_state(batch_size).to(device)
     features0 = reward_model.get_penultimate_layer(state0)
     features1 = reward_model.get_penultimate_layer(state1)
 
-    rewards0 = reward_fn(state0)
-    rewards1 = reward_fn(state1)
+    if (len(inspect.signature(reward_fn).parameters.keys()) == 2):
+        identity = torch.randint(0, 2, state0.shape, device=state0.device)
+        rewards0 = reward_fn(state0, identity)
+        rewards1 = reward_fn(state1, identity)
+    else:
+        rewards0 = reward_fn(state0)
+        rewards1 = reward_fn(state1)
     preferences = (rewards1 > rewards0).long()
+
+    #randomly flip
+    flip = torch.rand(preferences.shape, device=preferences.device) < flip_percentage
+    # if 0 -> 1, if 1 -> 0
+    preferences[flip] = 1 - preferences[flip]
 
     #print(f"labels: {labels}")
     #print(f"labels shape: {labels.shape}")
 
-    population, scores, best_scores = lexicase_search(preferences, features0, features1, num_iterations//10, num_iterations, 0.1, normalize=True, downsample_level=100)
+    population, scores, best_scores = lexicase_search(preferences, features0, features1, num_iterations//10, num_iterations, 0.01, normalize=True, downsample_level=5)
 
     sum_scores = np.sum(scores, axis=1)
     best_reward_lastlayer = torch.from_numpy(population[np.argmax(sum_scores)])
@@ -360,6 +517,8 @@ def train_lex(
 
     #interpolating the features to get variances
     state_interpolated = torch.linspace(0, 1, 100).to(device)
+    
+
     features_interpolated = reward_model.get_penultimate_layer(state_interpolated[:, None])
     # chain = torch.from_numpy(chain).squeeze(1)
     population = torch.from_numpy(population).to(device).squeeze(1).to(torch.float32)
@@ -367,7 +526,137 @@ def train_lex(
     print(f"chain dtype: {population.dtype}")
     returns = features_interpolated @ population.T
 
+    if (len(inspect.signature(reward_fn).parameters.keys()) == 2):
+        true_rewards_1 = reward_fn(state_interpolated, torch.tensor(0))
+        print(f"true_rewards_1 shape: {true_rewards_1.shape}")
+        print(f"true_rewards_1: {true_rewards_1}")
+
+        true_rewards_2 = reward_fn(state_interpolated, torch.tensor(1))
+        print(f"true_rewards_2 shape: {true_rewards_2.shape}")
+        print(f"true_rewards_2: {true_rewards_2}")
+
+        preference_matrix_1 = torch.zeros((100, 100), dtype=torch.long)
+        preference_matrix_2 = torch.zeros((100, 100), dtype=torch.long)
+
+        for i in range(100):
+            for j in range(100):
+                if (true_rewards_1[i] >= true_rewards_1[j]):
+                    preference_matrix_1[i, j] = 1
+
+                if (true_rewards_2[i] >= true_rewards_2[j]):
+                    preference_matrix_2[i, j] = 1
+
+        #pick one more individual
+
+        s0 = sample_state(40).to(device)
+        s1 = sample_state(40).to(device)
+        f0 = reward_model.get_penultimate_layer(s0)
+        f1 = reward_model.get_penultimate_layer(s1)
+        r0_z1 = reward_fn(s0, torch.tensor(1))
+        r1_z1 = reward_fn(s1, torch.tensor(1))
+        r0_z0 = reward_fn(s0, torch.tensor(0))
+        r1_z0 = reward_fn(s1, torch.tensor(0))
+        pp0 = (r1_z0 > r0_z0).long()
+        pp1 = (r1_z1 > r0_z1).long()
+
+        ind0, score0 = select_one(population, f0, f1, pp0) 
+        
+        ret0 = features_interpolated @ ind0.T
+        ind1, score1 = select_one(population, f0, f1, pp1)
+        ret1 = features_interpolated @ ind1.T
+
+        print(f"ind0: {ind0}")
+        print(f"scores0: {score0}")
+        print(f"ind1: {ind1}")
+        print(f"scores1: {score1}")
+
+        #normalize ret0 and ret1
+        ret0 = ret0 / torch.norm(ret0)
+        ret1 = ret1 / torch.norm(ret1)
+
+        #graph these individuals
+        #make it pretty
+        #plt.plot(state_interpolated.detach().numpy(), ret0.detach().numpy(), label="0")
+        #plt.plot(state_interpolated.detach().numpy(), ret1.detach().numpy(), label="1")
+        fig, ax1 = plt.subplots(figsize=(5, 5))
+        ax2 = ax1.twinx()
+        ax1.plot(state_interpolated.detach().numpy(), ret0.detach().numpy(), label="0", color='blue')
+        ax2.plot(state_interpolated.detach().numpy(), ret1.detach().numpy(), label="1", color='red')
+        lines, labels = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax2.legend(lines + lines2, labels + labels2, loc=0)
+        #plt.legend()
+        plt.savefig(f'./results/1d_identity/{batch_size}_{lr}_{num_iterations}/lexicase_individuals_{num_iterations}_{flip_percentage}.png')
+        plt.close()
+
+
+        #plot preference matrix
+        plt.pcolor(preference_matrix_1, cmap='hot', vmin=0, vmax=100)
+        plt.colorbar()
+        plt.savefig(f'./results/1d_identity/{batch_size}_{lr}_{num_iterations}/lexicase_preference_1_{num_iterations}_{flip_percentage}.png')
+        plt.close()
+
+        plt.pcolor(preference_matrix_2, cmap='hot', vmin=0, vmax=100)
+        plt.colorbar()
+        plt.savefig(f'./results/1d_identity/{batch_size}_{lr}_{num_iterations}/lexicase_preference_2_{num_iterations}_{flip_percentage}.png')
+        plt.close()
+        
+        #get preference passes
+        passes_1 = preference_pass_matrix(returns, preference_matrix_1)
+        passes_2 = preference_pass_matrix(returns, preference_matrix_2)
+
+        #sum of passes, save to text file
+        print(f"passes_1 shape: {passes_1.shape}")
+        print(f"passes_2 shape: {passes_2.shape}")
+        
+        sum_passes_1 = torch.sum(passes_1)
+        sum_passes_2 = torch.sum(passes_2)
+
+        with open(f'./results/1d_identity/{batch_size}_{lr}_{num_iterations}/lexicase_num_passes_{num_iterations}_{flip_percentage}.txt', 'w') as f:
+            f.write(f"sum_passes_1: {sum_passes_1}\n")
+            f.write(f"sum_passes_2: {sum_passes_2}\n")
+
+        #save heatmap
+        plt.pcolor(passes_1, cmap='hot', vmin=0, vmax=100)
+        plt.colorbar()
+        plt.savefig(f'./results/1d_identity/{batch_size}_{lr}_{num_iterations}/lexicase_passes_1_{num_iterations}_{flip_percentage}.png')
+        plt.close()
+        
+        plt.pcolor(passes_2, cmap='hot', vmin=0, vmax=100)
+        plt.colorbar()
+        plt.savefig(f'./results/1d_identity/{batch_size}_{lr}_{num_iterations}/lexicase_passes_2_{num_iterations}_{flip_percentage}.png')
+        plt.close()
+
+    else:
+        true_rewards = reward_fn(state_interpolated)
+        preference_matrix = torch.zeros((100, 100), dtype=torch.long)
+        for i in range(100):
+            for j in range(100):
+                if (true_rewards[i] >= true_rewards[j]):
+                    preference_matrix[i, j] = 1 #we prefer i over j
+
+        #get preference passes
+        passes = preference_pass_matrix(returns, preference_matrix)
+
+        #sum of passes, save to text file
+        sum_passes = torch.sum(passes)
+        with open(f'./results/1d_identity/{batch_size}_{lr}_{num_iterations}/lexicase_num_passes_{num_iterations}_{flip_percentage}.txt', 'w') as f:
+            f.write(f"sum_passes: {sum_passes}\n")
+
+        #save heatmap
+        plt.pcolor(passes, cmap='hot', vmin=0, vmax=100)
+        plt.colorbar()
+
+        plt.savefig(f'./results/1d_identity/{batch_size}_{lr}_{num_iterations}/lexicase_passes_{num_iterations}_{flip_percentage}.png')
+        plt.close()
+
+    #unique_indicies = remove_same_rankings(returns)
+
     mean_model = returns.mean(axis=1)
+    print(f"mean_model shape: {mean_model.shape}")
+    print(f"returns shape: {returns.shape}")
+    #print(f"unique_indicies shape: {unique_indicies.shape}")
+    #all_models = returns[:, unique_indicies]
     all_models = returns
     # print(f"returns shape: {returns.shape}")
     variances = torch.var(returns, axis=1)
@@ -386,13 +675,27 @@ def train_lex(
     #evaluate the model
     state0 = sample_state(batch_size).to(device)
     state1 = sample_state(batch_size).to(device)
-    rewards0 = reward_fn(state0)
-    rewards1 = reward_fn(state1)
-    loss = -best_reward_model.preference_logp(state0, state1, (rewards1 > rewards0).long()).mean()
-    print(f"loss for LEX BEST: {loss.item()}")
+    if (len(inspect.signature(reward_fn).parameters.keys()) == 2):
+        identity = torch.randint(0, 2, state0.shape, device=state0.device)
+        rewards0 = reward_fn(state0, identity)
+        rewards1 = reward_fn(state1, identity)
+    else:
+        rewards0 = reward_fn(state0)
+        rewards1 = reward_fn(state1)
+    #loss = -best_reward_model.preference_logp(state0, state1, (rewards1 > rewards0).long()).mean()
+    #print(f"loss for LEX BEST: {loss.item()}")
 
     return best_reward_model, variances, mean_model, all_models
 
+
+def reward_fn_1d_identity(state: torch.Tensor, identity: torch.Tensor) -> torch.Tensor:
+    state = state.squeeze(-1)
+    identity = identity.squeeze(-1)
+    rewards = state.clone()
+    rewards[(state >= 0.8) & (identity == 1)] *= 2
+    rewards[(state >= 0.8) & (identity == 0)] *= 0
+
+    return rewards
 
 def reward_fn_1d(state: torch.Tensor) -> torch.Tensor:
     state = state.squeeze(-1)
@@ -410,6 +713,67 @@ def reward_fn_2d(state: torch.Tensor) -> torch.Tensor:
     rewards[~b] = 0
     return rewards
 
+#this reward function implements cyclical preferences.
+#if identity is 0, then the reward is equal to the state
+# if identity is 1, then the reward is equal to a + 0.66 if a < 0.33 and (a-0.33) otherwise
+# if identity is 2, then the reward is equal to a + 0.33 if a < 0.66 and (a-0.66) otherwise
+def reward_fn_cycles(state: torch.Tensor, identity: torch.tensor) -> torch.Tensor:
+    state = state.squeeze(-1)
+    identity = identity.squeeze(-1)
+    rewards = state.clone()
+    rewards[identity == 1] = (state[identity == 1] + 0.66) % 1
+    rewards[identity == 2] = (state[identity == 2] + 0.33) % 1
+    return rewards
+
+def reward_fn_default(state: torch.Tensor) -> torch.Tensor:
+    return state.squeeze(-1).clone()
+
+#this function removes all reward hypotheses that are equivalent to each other based on how they rank
+def remove_same_rankings(returns):
+    #returns is a matrix of all returns for each hypothesis, there is a vector showing return for a = [0, 0.01, 0.02, ... 1]
+    # returns a vector of all_hypotheses that are not equivalent
+    print(f"SHAPE OF RETURNS: {returns.shape}")
+
+    #for each hypotheses, we need to rank the states
+    ranks = torch.argsort(returns, dim=0)
+    print(f"ranks: {ranks}")
+
+    #now, we need to combine all hypotheses that have the same ranking
+    unique_ranks_output = torch.unique(ranks, dim=1, return_inverse=True)
+    print(f"unique_ranks: {unique_ranks_output}")
+    print(f"inverse: {unique_ranks_output[1]}")
+
+    print(f"number unique: {unique_ranks_output[0].shape[1]}")
+
+    return unique_ranks_output[1]
+
+def sample_state_fn(n: int) -> torch.Tensor:
+    #return a nroamlly distributed sample from [0, 1] with center 0.2
+    return torch.rand((n, 1))
+    #return torch.clip(torch.randn((n, 1)) * 0.1 + 0.2, 0, 1)
+
+
+#given a set of returns, and a set of preferences,
+# we calculate whether, for each preference, there is at least one hypothesis that is consistent with the preference
+def preference_pass_matrix(returns, preference_matrix):
+    print(f"returns shape: {returns.shape}")
+    print(f"preference_matrix shape: {preference_matrix.shape}")
+    print(f"preference_matrix: {preference_matrix}")
+    passes = torch.zeros((preference_matrix.shape[0], preference_matrix.shape[1]), dtype=torch.int)
+    for i in range(preference_matrix.shape[0]):
+        for j in range(preference_matrix.shape[1]):
+            if (preference_matrix[i, j] == 1):
+                passes[i, j] = torch.sum(returns[i,:] >= returns[j,:])
+            else:
+                passes[i, j] = torch.sum(returns[i,:] <= returns[j,:])
+
+    #get sum of passes
+    return passes
+#in the categorical case, we simply sample many times and see if the preference is consistent with the hypothesis
+def preference_pass_matrix_categorical(returns, preferences):
+    pass
+
+
 def main(  # noqa: C901
     *,
     env_name: Literal["1d", "2d"],
@@ -418,6 +782,7 @@ def main(  # noqa: C901
     num_iterations: int,
     out_dir: str,
     reward_model_kwargs: Dict[str, Any] = {},
+    flips: float,
 ):
     reward_fn: Callable[[torch.Tensor], torch.Tensor]
     state_dim: int
@@ -425,11 +790,25 @@ def main(  # noqa: C901
     if env_name == "1d":
         reward_fn = reward_fn_1d
         state_dim = 1
+    elif env_name == "1d_identity":
+        reward_fn = reward_fn_1d_identity
+        state_dim = 1
     elif env_name == "2d":
         reward_fn = reward_fn_2d
         state_dim = 2
+    elif env_name == "cycles":
+        reward_fn = reward_fn_cycles
+        state_dim = 1
+    elif env_name == "default":
+        reward_fn = reward_fn_default
+        state_dim = 1
+    else:
+        raise ValueError(f"Unknown environment name: {env_name}")
 
-    sample_state = lambda n: torch.rand(n, state_dim)
+    sample_state = lambda n: sample_state_fn(n)
+    print(f"state_dim: {state_dim}")
+    print(f"state_shape: {sample_state(1).shape}")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     reward_models: Dict[str, BaseRewardModel] = {}
@@ -453,12 +832,14 @@ def main(  # noqa: C901
             lr=lr,
             num_iterations=num_iterations,
             device=device,
+            flip_percentage = flips
         )
         reward_model.eval()
         reward_models[reward_model_class.__name__] = reward_model
 
     #Bayesian REX
-    b_rex_model = MeanAndVarianceRewardModel(state_dim = state_dim, **(dict(reward_model_kwargs)))
+    reward_model_kwargs["num_layers"] = 2
+    b_rex_model = BaseRewardModel(state_dim = state_dim, **(dict(reward_model_kwargs)))
     b_rex_model, b_rex_variances, brex_mean, brex_all = train_brex(
         reward_model=b_rex_model,
         reward_fn=reward_fn,
@@ -467,17 +848,18 @@ def main(  # noqa: C901
         lr=lr,
         num_iterations=num_iterations,
         device=device,
+        flip_percentage=flips
     )
     b_rex_model.eval()
     reward_models["B_REX"] = b_rex_model
 
-    print(f"brex variances: {b_rex_variances}")
-    print(f"brex variances shape: {b_rex_variances.shape}")
-    print(f"brex mean: {brex_mean}")
-    print(f"brex mean shape: {brex_mean.shape}")
+    #print(f"brex variances: {b_rex_variances}")
+    #print(f"brex variances shape: {b_rex_variances.shape}")
+   # print(f"brex mean: {brex_mean}")
+    #print(f"brex mean shape: {brex_mean.shape}")
 
     #Lexicase
-    lex_model = MeanAndVarianceRewardModel(state_dim = state_dim, **(dict(reward_model_kwargs)))
+    lex_model = BaseRewardModel(state_dim = state_dim, **(dict(reward_model_kwargs)))
     lex_model, lex_variances, lex_mean, lex_all = train_lex(
         reward_model=lex_model,
         reward_fn=reward_fn,
@@ -486,15 +868,33 @@ def main(  # noqa: C901
         lr=lr,
         num_iterations=num_iterations,
         device=device,
+        flip_percentage = flips
     )
     lex_model.eval()
     reward_models["Lexicase"] = lex_model
 
-    print(f"lex variances: {lex_variances}")
-    print(f"lex variances shape: {lex_variances.shape}")
-    print(f"lex mean: {lex_mean}")
-    print(f"lex mean shape: {lex_mean.shape}")
+    #print(f"lex variances: {lex_variances}")
+    #print(f"lex variances shape: {lex_variances.shape}")
+    #print(f"lex mean: {lex_mean}")
+    #print(f"lex mean shape: {lex_mean.shape}")
 
+
+    lex_mcmc_model = BaseRewardModel(state_dim = state_dim, **(dict(reward_model_kwargs)))
+    lex_mcmc_model, lex_mcmc_variances, lex_mcmc_mean, lex_mcmc_all = train_brex(
+        reward_model=lex_mcmc_model,
+        reward_fn=reward_fn,
+        sample_state=sample_state,
+        batch_size=batch_size,
+        lr=lr,
+        num_iterations=num_iterations,
+        device=device,
+        likelihood = "lexicase",
+        flip_percentage=flips,
+    )
+
+    lex_mcmc_model.eval()
+    reward_models["Lexicase MCMC"] = lex_mcmc_model
+    
     #-=============================
     
     experiment_dir = os.path.join(
@@ -539,77 +939,77 @@ def main(  # noqa: C901
     matplotlib.rc("text.latex", preamble=latex_preamble)
     matplotlib.rc("font", size=9)
     matplotlib.rc("pgf", rcfonts=False, texsystem="pdflatex", preamble=latex_preamble)
-    figure = plt.figure(figsize=(5.5, 4.2))
+    figure = plt.figure(figsize=(8.5, 4.2))
     cmap = "Greys"
     color = "k"
     title_kwargs = dict(fontsize=9)
 
-    if env_name == "1d":
+    if env_name == "1d" or env_name == "1d_identity" or env_name == "cycles" or env_name == "default":
         x = torch.linspace(0, 1, 100, device=device)
         num_rows = 3
         num_cols = 3
 
-        # Combine first three subplots into one
-        combined_ax = figure.add_subplot(num_rows, num_cols, 1)
-        combined_ax.set_title("Normal preference learning", **title_kwargs)
-        combined_ax.set_xlabel(r"$\alta$")
-        combined_ax.set_xlim(0, 1)
+        # # Combine first three subplots into one
+        # combined_ax = figure.add_subplot(num_rows, num_cols, 1)
+        # combined_ax.set_title("Normal preference learning", **title_kwargs)
+        # combined_ax.set_xlabel(r"$\alta$")
+        # combined_ax.set_xlim(0, 1)
 
-        # Base Reward Model Output
-        rewards = reward_models["BaseRewardModel"](x[:, None]).detach().cpu().tolist()
-        combined_ax.plot(
-            x.cpu(),
-            rewards,
-            color="k",
-            label=r"$\learnedutility(\alta)$",
-        )
-        combined_ax.set_ylim(
-            [
-                -0.2 * max(rewards) + 1.2 * min(rewards),
-                1.2 * max(rewards) - 0.2 * min(rewards),
-            ]
-        )
-        combined_ax.annotate(
-            r"$\learnedutility(\alta)$",
-            xy=(x[65].item(), rewards[65]),
-            textcoords="offset points",
-            xytext=(-3, 3),
-            color="k",
-            ha="right",
-        )
+        # # Base Reward Model Output
+        # rewards = reward_models["BaseRewardModel"](x[:, None]).detach().cpu().tolist()
+        # combined_ax.plot(
+        #     x.cpu(),
+        #     rewards,
+        #     color="k",
+        #     label=r"$\learnedutility(\alta)$",
+        # )
+        # combined_ax.set_ylim(
+        #     [
+        #         -0.2 * max(rewards) + 1.2 * min(rewards),
+        #         1.2 * max(rewards) - 0.2 * min(rewards),
+        #     ]
+        # )
+        # combined_ax.annotate(
+        #     r"$\learnedutility(\alta)$",
+        #     xy=(x[65].item(), rewards[65]),
+        #     textcoords="offset points",
+        #     xytext=(-3, 3),
+        #     color="k",
+        #     ha="right",
+        # )
 
         # combined_ax.set_ylabel(r"$\text{Learned Utility}(\alpha)$", color=color)
         # combined_ax.tick_params(axis='y', labelcolor=color)
 
         # Creating twin X-axis for Borda Count and Expected Utility
-        twin_ax = combined_ax.twinx()
+        #twin_ax = combined_ax.twinx()
 
         # Borda Count
-        bc = torch.empty_like(x)
-        bc[x < 0.8] = (0.1 + x)[x < 0.8]
-        bc[x >= 0.8] = (0.275 + 0.25 * x)[x >= 0.8]
-        twin_ax.plot(x.cpu(), bc.cpu(), color="tab:blue", label=r"$\bordacount(\alta)$")
-        twin_ax.annotate(
-            r"$\bordacount(\alta)$",
-            xy=(x[35].item(), bc[35].item()),
-            textcoords="offset points",
-            xytext=(-3, 3),
-            color="tab:blue",
-            ha="right",
-        )
+        # bc = torch.empty_like(x)
+        # bc[x < 0.8] = (0.1 + x)[x < 0.8]
+        # bc[x >= 0.8] = (0.275 + 0.25 * x)[x >= 0.8]
+        # twin_ax.plot(x.cpu(), bc.cpu(), color="tab:blue", label=r"$\bordacount(\alta)$")
+        # twin_ax.annotate(
+        #     r"$\bordacount(\alta)$",
+        #     xy=(x[35].item(), bc[35].item()),
+        #     textcoords="offset points",
+        #     xytext=(-3, 3),
+        #     color="tab:blue",
+        #     ha="right",
+        # )
 
-        # Expected Utility Function
-        twin_ax.plot(x.cpu(), x.cpu(), color="tab:red", label=r"$\exutility(\alta)$")
-        twin_ax.set_yticks([])
-        twin_ax.annotate(
-            r"$\exutility(\alta)$",
-            xy=(x[50].item(), x[50].item()),
-            textcoords="offset points",
-            xytext=(3, -5),
-            color="tab:red",
-            ha="left",
-        )
-        combined_ax.set_yticks([])
+        # # Expected Utility Function
+        # twin_ax.plot(x.cpu(), x.cpu(), color="tab:red", label=r"$\exutility(\alta)$")
+        # twin_ax.set_yticks([])
+        # twin_ax.annotate(
+        #     r"$\exutility(\alta)$",
+        #     xy=(x[50].item(), x[50].item()),
+        #     textcoords="offset points",
+        #     xytext=(3, -5),
+        #     color="tab:red",
+        #     ha="left",
+        # )
+        # combined_ax.set_yticks([])
 
         # twin_ax.set_ylabel(r"$\text{Utility Measures}$", color='C1')
         # twin_ax.tick_params(axis='y', labelcolor='C1')
@@ -626,35 +1026,47 @@ def main(  # noqa: C901
         #     borderaxespad=0.1,
         # )
 
-        print(f"brex model: {b_rex_model(x[:, None]).detach().cpu().shape}")
+        #print(f"brex model: {b_rex_model(x[:, None]).detach().cpu().shape}")
 
         #BREX Subplot
-        brex_ax = figure.add_subplot(num_rows, num_cols, 2)
+        brex_ax = figure.add_subplot(num_rows, num_cols, 1)
         brex_ax.set_title("B-REX MAP", **title_kwargs)
         brex_ax.set_xlabel(r"$\alta$")
         brex_ax.set_ylabel(r"$\hat{\mu}(\alta)$")
         brex_ax.set_xlim(0, 1)
-        brex_ax.plot(x.cpu(), b_rex_model(x[:, None]).detach().cpu()[:, 0], color=color)
+        if len(b_rex_model(x[:,None]).shape) > 1:
+            brex_ax.plot(x.cpu(), b_rex_model(x[:, None]).detach().cpu()[:, 0], color=color)
+        else:
+            brex_ax.plot(x.cpu(), b_rex_model(x[:, None]).detach().cpu(), color=color)
         b_rex_std = torch.sqrt(b_rex_variances).detach().cpu()
         #plot std from 0
         #brex_ax.fill_between(x.cpu(), 0, b_rex_std, alpha=0.2, color=color)
 
-        brex_ax = figure.add_subplot(num_rows, num_cols, 5)
+        brex_ax = figure.add_subplot(num_rows, num_cols, 2)
         brex_ax.set_title("B-REX All", **title_kwargs)
         brex_ax.set_xlabel(r"$\alta$")
         brex_ax.set_ylabel(r"$\hat{\mu}(\alta)$")
         brex_ax.set_xlim(0, 1)
-        brex_ax.plot(x.cpu(), brex_all.detach().cpu(), color=color, alpha=0.1)
+        brex_ax.plot(x.cpu(), brex_all.detach().cpu(), color=color, alpha=0.005)
 
-        brex_ax = figure.add_subplot(num_rows, num_cols, 8)
-        brex_ax.set_title("B-REX Samples", **title_kwargs)
+        #plot mean of B-REX
+        brex_ax = figure.add_subplot(num_rows, num_cols, 3)
+        brex_ax.set_title("B-REX Mean", **title_kwargs)
         brex_ax.set_xlabel(r"$\alta$")
         brex_ax.set_ylabel(r"$\hat{\mu}(\alta)$")
         brex_ax.set_xlim(0, 1)
-        print(f"brex all shape: {brex_all.shape}")
-        #randomly sample 10 models
-        brex_samples = brex_all[:,np.random.choice(brex_all.shape[1], 10, replace=False)]
-        brex_ax.plot(x.cpu(), brex_samples.detach().cpu(), color=color, alpha=0.5)
+        brex_ax.plot(x.cpu(), brex_mean.detach().cpu(), color="tab:red", label=r"$\exutility(\alta)$")
+
+
+        # brex_ax = figure.add_subplot(num_rows, num_cols, 8)
+        # brex_ax.set_title("B-REX Samples", **title_kwargs)
+        # brex_ax.set_xlabel(r"$\alta$")
+        # brex_ax.set_ylabel(r"$\hat{\mu}(\alta)$")
+        # brex_ax.set_xlim(0, 1)
+        # print(f"brex all shape: {brex_all.shape}")
+        # #randomly sample 10 models
+        # brex_samples = brex_all[:,np.random.choice(brex_all.shape[1], 10, replace=False)]
+        # brex_ax.plot(x.cpu(), brex_samples.detach().cpu(), color=color, alpha=0.5)
 
 
         #plot std
@@ -666,12 +1078,23 @@ def main(  # noqa: C901
         
 
         #lexicase Subplot
-        lex_ax = figure.add_subplot(num_rows, num_cols, 3)
+        lex_ax = figure.add_subplot(num_rows, num_cols, 4)
         lex_ax.set_title("Lexicase Best", **title_kwargs)
         lex_ax.set_xlabel(r"$\alta$")
         lex_ax.set_ylabel(r"$\hat{\mu}(\alta)$")
         lex_ax.set_xlim(0, 1)
-        lex_ax.plot(x.cpu(), lex_model(x[:, None]).detach().cpu()[:, 0], color=color)
+
+        print(f"x shape: {x.shape}")
+        print(f"x type: {x.dtype}")
+        #convert lex model weights to float
+        lex_model.to(torch.float32)
+        print(f"lex model: {lex_model(x[:, None]).detach().cpu().shape}")
+
+        if len(lex_model(x[:,None]).shape) > 1:
+            lex_ax.plot(x.cpu(), lex_model(x[:, None]).detach().cpu()[:, 0], color=color)
+        else:
+            lex_ax.plot(x.cpu(), lex_model(x[:, None]).detach().cpu(), color=color)
+        #lex_ax.plot(x.cpu(), lex_model(x[:, None]).detach().cpu()[:, 0], color=color)
         #lex_std = torch.sqrt(lex_variances).detach().cpu()
         #plot std from 0    
 
@@ -681,23 +1104,31 @@ def main(  # noqa: C901
         #lex_ax.fill_between(x.cpu(), lex_model(x[:, None]).detach().cpu() - lex_std, lex_model(x[:, None]).detach().cpu() + lex_std, alpha=0.2, color=color)
 
         #lex all
-        lex_ax = figure.add_subplot(num_rows, num_cols, 6)
+        lex_ax = figure.add_subplot(num_rows, num_cols, 5)
         lex_ax.set_title("Lexicase All", **title_kwargs)
         lex_ax.set_xlabel(r"$\alta$")
         lex_ax.set_ylabel(r"$\hat{\mu}(\alta)$")
         lex_ax.set_xlim(0, 1)
-        lex_ax.plot(x.cpu(), lex_all.detach().cpu(), color=color, alpha=0.1)
+        lex_ax.plot(x.cpu(), lex_all.detach().cpu(), color=color, alpha=0.5)
 
-        lex_ax = figure.add_subplot(num_rows, num_cols, 9)
-        lex_ax.set_title("Lexicase Samples", **title_kwargs)
+        # lex_ax = figure.add_subplot(num_rows, num_cols, 9)
+        # lex_ax.set_title("Lexicase Samples", **title_kwargs)
+        # lex_ax.set_xlabel(r"$\alta$")
+        # lex_ax.set_ylabel(r"$\hat{\mu}(\alta)$")
+        # lex_ax.set_xlim(0, 1)
+        # #randomly sample 10 models
+        # lex_samples = lex_all[:,np.random.choice(lex_all.shape[1], 10, replace=False)]
+        # lex_ax.plot(x.cpu(), lex_samples.detach().cpu(), color=color, alpha=0.5)
+
+        #lexicase mean
+        lex_ax = figure.add_subplot(num_rows, num_cols, 6)
+        lex_ax.set_title("Lexicase Mean", **title_kwargs)
         lex_ax.set_xlabel(r"$\alta$")
         lex_ax.set_ylabel(r"$\hat{\mu}(\alta)$")
         lex_ax.set_xlim(0, 1)
-        #randomly sample 10 models
-        lex_samples = lex_all[:,np.random.choice(lex_all.shape[1], 10, replace=False)]
-        lex_ax.plot(x.cpu(), lex_samples.detach().cpu(), color=color, alpha=0.5)
+        lex_ax.plot(x.cpu(), lex_mean.detach().cpu(), color="tab:red", label=r"$\exutility(\alta)$")
+        #lex_ax.fill_between(x.cpu(), lex_mean.detach().cpu() - lex_std, lex_mean.detach().cpu() + lex_std, alpha=0.2, color="tab:red")
 
-        #mean
         #lex_ax.plot(x.cpu(), lex_mean.detach().cpu(), color="tab:red", label=r"$\exutility(\alta)$")
         #lex_ax.fill_between(x.cpu(), lex_mean.detach().cpu() - lex_std, lex_mean.detach().cpu() + lex_std, alpha=0.2, color="tab:red")
         
@@ -739,8 +1170,38 @@ def main(  # noqa: C901
         #     cmap=cmap,
         # )
 
+        #brex w/ lexicase likelihood
+        lexmcmc_ax = figure.add_subplot(num_rows, num_cols, 7)
+        lexmcmc_ax.set_title("Lexicase MCMC MAP", **title_kwargs)
+        lexmcmc_ax.set_xlabel(r"$\alta$")
+        lexmcmc_ax.set_ylabel(r"$\hat{\mu}(\alta)$")
+        lexmcmc_ax.set_xlim(0, 1)
+        if len(lex_mcmc_model(x[:,None]).shape) > 1:
+            lexmcmc_ax.plot(x.cpu(), lex_mcmc_model(x[:, None]).detach().cpu()[:, 0], color=color)
+        else:
+            lexmcmc_ax.plot(x.cpu(), lex_mcmc_model(x[:, None]).detach().cpu(), color=color)
+        lex_mcmc_std = torch.sqrt(lex_mcmc_variances).detach().cpu()
+        #plot std from 0
+        #brex_ax.fill_between(x.cpu(), 0, lex_mcmc_std, alpha=0.2, color=color)
+
+        lexmcmc_ax = figure.add_subplot(num_rows, num_cols, 8)
+        lexmcmc_ax.set_title("Lexicase MCMC All", **title_kwargs)
+        lexmcmc_ax.set_xlabel(r"$\alta$")
+        lexmcmc_ax.set_ylabel(r"$\hat{\mu}(\alta)$")
+        lexmcmc_ax.set_xlim(0, 1)
+        lexmcmc_ax.plot(x.cpu(), lex_mcmc_all.detach().cpu(), color=color, alpha=0.005)
+
+        #plot mean of B-REX
+        lexmcmc_ax = figure.add_subplot(num_rows, num_cols, 9)
+        lexmcmc_ax.set_title("Lexicase MCMC Mean", **title_kwargs)
+        lexmcmc_ax.set_xlabel(r"$\alta$")
+        lexmcmc_ax.set_ylabel(r"$\hat{\mu}(\alta)$")
+        lexmcmc_ax.set_xlim(0, 1)
+        lexmcmc_ax.plot(x.cpu(), lex_mcmc_mean.detach().cpu(), color="tab:red", label=r"$\exutility(\alta)$")
+
+
         figure.tight_layout(pad=0.1)
-        figure.subplots_adjust(wspace=0.7, left=0.05, right=0.95)
+        figure.subplots_adjust(wspace=0.7, left=0.15, right=0.95)
     elif env_name == "2d":
         x = torch.linspace(0, 1, 20, device=device)
         y = torch.linspace(0, 1, 20, device=device)
@@ -841,8 +1302,8 @@ def main(  # noqa: C901
         figure.tight_layout(pad=0.1)
         figure.subplots_adjust(hspace=1, wspace=0.5)
 
-    figure.savefig(os.path.join(experiment_dir, f"{env_name}.png"), dpi=300)
-    figure.savefig(os.path.join(experiment_dir, f"{env_name}.pgf"), dpi=300)
+    figure.savefig(os.path.join(experiment_dir, f"{env_name}_{flips}.png"), dpi=300)
+    figure.savefig(os.path.join(experiment_dir, f"{env_name}_{flips}.pgf"), dpi=300)
 
 
 if __name__ == "__main__":
@@ -852,6 +1313,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--num_iterations", type=int, default=1000)
     parser.add_argument("--out_dir", type=str, default="results")
+    parser.add_argument("--flips", type=float, default=0)
     args = parser.parse_args()
 
     main(
@@ -860,4 +1322,5 @@ if __name__ == "__main__":
         lr=args.lr,
         num_iterations=args.num_iterations,
         out_dir=args.out_dir,
+        flips=args.flips
     )

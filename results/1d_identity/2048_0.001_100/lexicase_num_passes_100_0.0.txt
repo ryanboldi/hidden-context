@@ -1,0 +1,2 @@
+sum_passes_1: 66300
+sum_passes_2: 100000

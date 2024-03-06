@@ -64,6 +64,10 @@ def calc_pref_ranking_loss(last_layer, features0, features1, prefs, confidence=1
         linear = last_layer.weight.data
         weights = linear.squeeze()
 
+        ##print(f"weights: {weights}")
+        #print(f"features0: {features0}")
+        #print(f"features1: {features1}")
+
         if len(weights.shape) > 1:
             weights = weights[0]
 
@@ -83,15 +87,51 @@ def calc_pref_ranking_loss(last_layer, features0, features1, prefs, confidence=1
 
     return cum_log_likelihood
 
+def calc_lexicase_pairwise_ranking_loss(prop_layer, cur_layer, features0, features1, prefs, confidence=1):
+    """use (i,j) indices and precomputed feature counts to do faster pairwise ranking loss"""
+    # device = torch.device("cuda")
+    # Assume that we are on a CUDA machine, then this should print a CUDA device:
+    # print(device)
+    # don't need any gradients
+    all_scores = []
+    for last_layer in [prop_layer, cur_layer]:
+        linear = last_layer.weight.data  # not using bias
+        # print(linear)
+        # print(bias)
+        weights = (
+            linear.squeeze()
+        )  # append bias and weights from last fc layer together
+        # print('weights',weights)
+        # print('demo_cnts', demo_cnts)
+        returns0 = weights @ features0.T 
+        returns1 = weights @ features1.T
 
-def mcmc_map_search(reward_net, pairwise_prefs, features0, features1, num_steps, step_stdev, confidence):
+        #removed positivity prior
+
+        outputs = np.array((returns0 > returns1), dtype=np.float32)
+        scores = np.array(np.abs(prefs - outputs))
+        #swap 0s and 1s
+        scores = np.abs(scores - 1)
+
+        all_scores.append(scores)
+
+    cur_scores, prop_scores = all_scores
+
+    # calc lexicase likelihood
+    cur_likelihood = torch.tensor(np.sum((cur_scores - prop_scores) == 1))
+    prop_likelihood = torch.tensor(np.sum((prop_scores - cur_scores) == 1))
+
+    return cur_likelihood, prop_likelihood, np.sum(prop_scores)
+
+
+def mcmc_map_search(reward_net, pairwise_prefs, features0, features1, num_steps, step_stdev, confidence, likelihood = "bradley-terry"):
     '''run metropolis hastings MCMC and record weights in chain'''
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     #last_layer = reward_net.last_layer 
     last_layer = torch.nn.Linear(reward_net.last_layer.in_features, 1, bias=False).to(device)
 
     #copy first dim of last layuer over
-    last_layer.weight.data = reward_net.last_layer.weight.data[0]
+    #last_layer.weight.data = reward_net.last_layer.weight.data[0]
     #print(f"last layer: {last_layer}")  
 
     #random initialization
@@ -112,7 +152,12 @@ def mcmc_map_search(reward_net, pairwise_prefs, features0, features1, num_steps,
     #end_t = time.time()
     #print("slow likelihood", starting_loglik, "time", 1000*(end_t - start_t))
     #start_t = time.time()s
-    starting_loglik = calc_pref_ranking_loss(last_layer, features0, features1, pairwise_prefs, confidence)
+    if likelihood == "bradley-terry":
+        starting_loglik = calc_pref_ranking_loss(last_layer, features0, features1, pairwise_prefs, confidence)
+    elif likelihood == "lexicase": #start with accept
+        starting_loglik = torch.tensor(0)
+    else:
+        print("likelihood not recognized")
     #starting_loglik = calc_linearized_pairwise_ranking_loss(last_layer, pairwise_prefs, demo_cnts, confidence)
     #end_t = time.time()
     #print("new fast? likelihood", new_starting_loglik, "time", 1000*(end_t - start_t))
@@ -146,9 +191,29 @@ def mcmc_map_search(reward_net, pairwise_prefs, features0, features1, num_steps,
             for param in proposal_reward.parameters():
                 param.div_(torch.from_numpy(l2_norm).float().to(device))
             
-        prop_loglik = calc_pref_ranking_loss(last_layer, features0, features1, pairwise_prefs, confidence)
+        if likelihood == "bradley-terry":
+            prop_loglik = calc_pref_ranking_loss(proposal_reward, features0, features1, pairwise_prefs, confidence)
+        else:
+            cur_loglik, prop_loglik, prop_scores = calc_lexicase_pairwise_ranking_loss(proposal_reward, cur_reward, features0, features1, pairwise_prefs, confidence)
+        #print(f"step {i} loglik: {prop_loglik}")
 
-        if prop_loglik > cur_loglik:
+        if (likelihood == "lexicase"):
+            if np.random.rand() < (prop_loglik/(cur_loglik + prop_loglik)):
+                accept_cnt += 1
+                cur_reward = copy.deepcopy(proposal_reward)
+                cur_loglik = prop_loglik
+            else:
+                #reject and stick with cur_reward
+                reject_cnt += 1
+            
+            if prop_loglik > map_loglik:
+                map_loglik = prop_loglik
+                map_reward = copy.deepcopy(proposal_reward)
+                print("step", i)
+
+                print("updating map loglikelihood to ", prop_loglik)
+                print("MAP reward so far", map_reward)
+        elif prop_loglik > cur_loglik:
             #accept always
             accept_cnt += 1
             cur_reward = copy.deepcopy(proposal_reward)
