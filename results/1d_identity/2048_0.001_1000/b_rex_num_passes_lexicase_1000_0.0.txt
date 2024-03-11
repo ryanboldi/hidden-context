@@ -1,2 +1,2 @@
-sum_passes_1: 66374552
-sum_passes_2: 99319932
+sum_passes_1: 63199530
+sum_passes_2: 85519522

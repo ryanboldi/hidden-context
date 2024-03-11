@@ -304,7 +304,7 @@ def train_brex(
     #print(f"labels: {labels}")
     #print(f"labels shape: {labels.shape}")
 
-    best_reward_lastlayer, chain, logliks = mcmc_map_search(reward_model, preferences, features0, features1, num_iterations*10, 0.01, 1, likelihood)
+    best_reward_lastlayer, chain, logliks = mcmc_map_search(reward_model, preferences, features0, features1, num_iterations*10, 0.1, 1, likelihood)
 
     #interpolating the features to get variances
     state_interpolated = torch.linspace(0, 1, 100).to(device)
@@ -341,8 +341,10 @@ def train_brex(
         sum_passes_1 = torch.sum(passes_1)
         sum_passes_2 = torch.sum(passes_2)
 
-        s0 = sample_state(40).to(device)
-        s1 = sample_state(40).to(device)
+        s0 = sample_state(50).to(device)
+        s1 = sample_state(50).to(device)
+        #s0 = torch.linspace(0, 1, 20).to(device)[:, None]
+        #s1 = torch.linspace(0.1, 1, 20).to(device)[:, None]
         f0 = reward_model.get_penultimate_layer(s0)
         f1 = reward_model.get_penultimate_layer(s1)
         r0_z1 = reward_fn(s0, torch.tensor(1))
@@ -507,7 +509,7 @@ def train_lex(
     #print(f"labels: {labels}")
     #print(f"labels shape: {labels.shape}")
 
-    population, scores, best_scores = lexicase_search(preferences, features0, features1, num_iterations//10, num_iterations, 0.01, normalize=True, downsample_level=5)
+    population, scores, best_scores = lexicase_search(preferences, features0, features1, num_iterations//10, num_iterations//10, 0.1, normalize=True, downsample_level=1)
 
     sum_scores = np.sum(scores, axis=1)
     best_reward_lastlayer = torch.from_numpy(population[np.argmax(sum_scores)])
@@ -548,8 +550,11 @@ def train_lex(
 
         #pick one more individual
 
-        s0 = sample_state(40).to(device)
-        s1 = sample_state(40).to(device)
+        s0 = sample_state(50).to(device)
+        s1 = sample_state(50).to(device)
+        #take states between 0 and 1
+        #s0 = torch.linspace(0, 1, 50).to(device)[:, None]
+        #s1 = torch.linspace(0.1, 1, 20).to(device)[:, None]
         f0 = reward_model.get_penultimate_layer(s0)
         f1 = reward_model.get_penultimate_layer(s1)
         r0_z1 = reward_fn(s0, torch.tensor(1))
@@ -1079,7 +1084,7 @@ def main(  # noqa: C901
 
         #lexicase Subplot
         lex_ax = figure.add_subplot(num_rows, num_cols, 4)
-        lex_ax.set_title("Lexicase Best", **title_kwargs)
+        lex_ax.set_title("PaRI-P Best", **title_kwargs)
         lex_ax.set_xlabel(r"$\alta$")
         lex_ax.set_ylabel(r"$\hat{\mu}(\alta)$")
         lex_ax.set_xlim(0, 1)
@@ -1105,7 +1110,7 @@ def main(  # noqa: C901
 
         #lex all
         lex_ax = figure.add_subplot(num_rows, num_cols, 5)
-        lex_ax.set_title("Lexicase All", **title_kwargs)
+        lex_ax.set_title("PaRI-P All", **title_kwargs)
         lex_ax.set_xlabel(r"$\alta$")
         lex_ax.set_ylabel(r"$\hat{\mu}(\alta)$")
         lex_ax.set_xlim(0, 1)
@@ -1122,7 +1127,7 @@ def main(  # noqa: C901
 
         #lexicase mean
         lex_ax = figure.add_subplot(num_rows, num_cols, 6)
-        lex_ax.set_title("Lexicase Mean", **title_kwargs)
+        lex_ax.set_title("PaRI-P Mean", **title_kwargs)
         lex_ax.set_xlabel(r"$\alta$")
         lex_ax.set_ylabel(r"$\hat{\mu}(\alta)$")
         lex_ax.set_xlim(0, 1)
@@ -1172,7 +1177,7 @@ def main(  # noqa: C901
 
         #brex w/ lexicase likelihood
         lexmcmc_ax = figure.add_subplot(num_rows, num_cols, 7)
-        lexmcmc_ax.set_title("Lexicase MCMC MAP", **title_kwargs)
+        lexmcmc_ax.set_title("PaRI-B MAP", **title_kwargs)
         lexmcmc_ax.set_xlabel(r"$\alta$")
         lexmcmc_ax.set_ylabel(r"$\hat{\mu}(\alta)$")
         lexmcmc_ax.set_xlim(0, 1)
@@ -1185,7 +1190,7 @@ def main(  # noqa: C901
         #brex_ax.fill_between(x.cpu(), 0, lex_mcmc_std, alpha=0.2, color=color)
 
         lexmcmc_ax = figure.add_subplot(num_rows, num_cols, 8)
-        lexmcmc_ax.set_title("Lexicase MCMC All", **title_kwargs)
+        lexmcmc_ax.set_title("PaRI-B All", **title_kwargs)
         lexmcmc_ax.set_xlabel(r"$\alta$")
         lexmcmc_ax.set_ylabel(r"$\hat{\mu}(\alta)$")
         lexmcmc_ax.set_xlim(0, 1)
@@ -1193,7 +1198,7 @@ def main(  # noqa: C901
 
         #plot mean of B-REX
         lexmcmc_ax = figure.add_subplot(num_rows, num_cols, 9)
-        lexmcmc_ax.set_title("Lexicase MCMC Mean", **title_kwargs)
+        lexmcmc_ax.set_title("PaRI-B Mean", **title_kwargs)
         lexmcmc_ax.set_xlabel(r"$\alta$")
         lexmcmc_ax.set_ylabel(r"$\hat{\mu}(\alta)$")
         lexmcmc_ax.set_xlim(0, 1)
